@@ -159,6 +159,11 @@ class LoopMakerApp:
                 self.status_var.set(f"読み込み中… {i}/{self.total_frames}")
                 self.root.update()
 
+        # ==========================================
+        # 修正ポイント：実際に読み込めたフレーム数を取得する
+        # ==========================================
+        actual_total_frames = len(small_frames)
+
         self.status_var.set("最適ループ区間を検索中…")
         self.root.update()
 
@@ -166,10 +171,11 @@ class LoopMakerApp:
         best_start = 0
         best_end = 0
 
-        for start in range(0, self.total_frames - min_length, step):
+        # 検索ループのベースを self.total_frames から actual_total_frames に変更
+        for start in range(0, actual_total_frames - min_length, step):
             gray_start = small_frames[start]
 
-            end_max = min(start + max_length, self.total_frames)
+            end_max = min(start + max_length, actual_total_frames)
             for end in range(start + min_length, end_max):
                 gray_end = small_frames[end]
                 score = ssim(gray_start, gray_end)
@@ -180,7 +186,8 @@ class LoopMakerApp:
                     best_end = end
 
             if start % (step * 2) == 0:   # 進捗更新を少し減らす
-                self.status_var.set(f"検索中… {start}/{self.total_frames}（ベスト: {best_score:.4f}）")
+                # ここも実際のフレーム数を表示するようにしておくと丁寧だぞ
+                self.status_var.set(f"検索中… {start}/{actual_total_frames}（ベスト: {best_score:.4f}）")
                 self.root.update()
 
         if best_score == -1.0:

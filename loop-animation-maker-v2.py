@@ -7,6 +7,8 @@ import datetime
 import os
 import threading
 import heapq
+import subprocess
+import sys
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -167,6 +169,74 @@ class LoopMakerApp:
         self.btn_export.config(state=tk.DISABLED)
         threading.Thread(target=self.export_loop, daemon=True).start()
 
+
+    def get_app_dir(self):
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def get_ffmpeg_path(self):
+        app_dir = self.get_app_dir()
+        candidates = [
+            os.path.join(app_dir, "ffmpeg.exe"),
+            os.path.join(app_dir, "ffmpeg"),
+        ]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def open_ffmpeg_writer(self, out_path, fps, width, height):
+        ffmpeg_path = self.get_ffmpeg_path()
+        if not ffmpeg_path:
+            raise FileNotFoundError("ffmpeg.exe がスクリプトと同じフォルダにありません。")
+
+        # X投稿で弾かれにくい H.264 / yuv420p / faststart のMP4を直接生成する。
+        # rawvideoとしてOpenCVのBGRフレームをstdinへ流し込む。
+        safe_fps = float(fps) if fps and fps > 0 else 60.0
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}",
+            "-r", f"{safe_fps:.6f}",
+            "-i", "-",
+            "-an",
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "high",
+            "-preset", "medium",
+            "-crf", "18",
+            "-movflags", "+faststart",
+            out_path,
+        ]
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+
+    def write_frame_to_ffmpeg(self, proc, frame):
+        if proc.poll() is not None:
+            stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+            raise RuntimeError(f"ffmpeg が途中で停止しました。\n{stderr}")
+        proc.stdin.write(frame.tobytes())
+
+    def close_ffmpeg_writer(self, proc):
+        if proc.stdin:
+            proc.stdin.close()
+        stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+        ret = proc.wait()
+        if ret != 0:
+            raise RuntimeError(f"ffmpeg の書き出しに失敗しました。\n{stderr}")
+
     def export_loop(self):
         self.status_var.set("全フレームを高速読み込み中…")
         self.root.update()
@@ -289,84 +359,107 @@ class LoopMakerApp:
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+
+        try:
+            out = self.open_ffmpeg_writer(out_path, fps, width, height)
+        except Exception as e:
+            self.status_var.set(f"エラー：{e}")
+            self.btn_export.config(state=tk.NORMAL)
+            return
 
         loop_length = best_end - best_start + 1
         wrote_frames = 0
         used_fade_length = 0
 
-        if self.fade_var.get() == 1:
-            requested_fade_length = max(1, self.fade_length_var.get())
-            # 先頭Nフレームを削り、末尾Nフレームを置き換えるので、最低でも2N+1程度の余裕が必要。
-            # 短い区間では自動的にフェード長を短くする。
-            used_fade_length = min(requested_fade_length, max(1, (loop_length - 1) // 2))
+        write_error = None
+        try:
+            if self.fade_var.get() == 1:
+                requested_fade_length = max(1, self.fade_length_var.get())
+                # 先頭Nフレームを削り、末尾Nフレームを置き換えるので、最低でも2N+1程度の余裕が必要。
+                # 短い区間では自動的にフェード長を短くする。
+                used_fade_length = min(requested_fade_length, max(1, (loop_length - 1) // 2))
 
-            if used_fade_length < 1 or loop_length <= used_fade_length:
-                used_fade_length = 0
+                if used_fade_length < 1 or loop_length <= used_fade_length:
+                    used_fade_length = 0
 
-        if used_fade_length == 0:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, best_start)
-            for _ in range(best_start, best_end + 1):
-                ret, frame = self.cap.read()
-                if ret:
-                    out.write(frame)
-                    wrote_frames += 1
-        else:
-            fade_length = used_fade_length
-
-            # 合成に使う先頭Nフレームを先に保持
-            start_frames = []
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, best_start)
-            for _ in range(fade_length):
-                ret, frame = self.cap.read()
-                if ret:
-                    start_frames.append(frame)
-
-            # 合成に使う末尾Nフレームを保持
-            end_frames = []
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, best_end - fade_length + 1)
-            for _ in range(fade_length):
-                ret, frame = self.cap.read()
-                if ret:
-                    end_frames.append(frame)
-
-            actual_fade_length = min(len(start_frames), len(end_frames))
-
-            if actual_fade_length < 1:
-                # 念のため。読み込みに失敗した場合は通常書き出しへフォールバック。
+            if used_fade_length == 0:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, best_start)
                 for _ in range(best_start, best_end + 1):
                     ret, frame = self.cap.read()
                     if ret:
-                        out.write(frame)
+                        self.write_frame_to_ffmpeg(out, frame)
                         wrote_frames += 1
-                used_fade_length = 0
             else:
-                fade_length = actual_fade_length
-                used_fade_length = actual_fade_length
+                fade_length = used_fade_length
 
-                # 先頭Nフレームは末尾でフェードインさせるため、通常部分からは削る。
-                normal_start = best_start + fade_length
-                normal_end = best_end - fade_length
+                # 合成に使う先頭Nフレームを先に保持
+                start_frames = []
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, best_start)
+                for _ in range(fade_length):
+                    ret, frame = self.cap.read()
+                    if ret:
+                        start_frames.append(frame)
 
-                if normal_start <= normal_end:
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, normal_start)
-                    for _ in range(normal_start, normal_end + 1):
+                # 合成に使う末尾Nフレームを保持
+                end_frames = []
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, best_end - fade_length + 1)
+                for _ in range(fade_length):
+                    ret, frame = self.cap.read()
+                    if ret:
+                        end_frames.append(frame)
+
+                actual_fade_length = min(len(start_frames), len(end_frames))
+
+                if actual_fade_length < 1:
+                    # 念のため。読み込みに失敗した場合は通常書き出しへフォールバック。
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, best_start)
+                    for _ in range(best_start, best_end + 1):
                         ret, frame = self.cap.read()
                         if ret:
-                            out.write(frame)
+                            self.write_frame_to_ffmpeg(out, frame)
                             wrote_frames += 1
+                    used_fade_length = 0
+                else:
+                    fade_length = actual_fade_length
+                    used_fade_length = actual_fade_length
 
-                # 末尾Nフレームを、先頭Nフレームへ向かってクロスフェード。
-                # 最後の合成フレームは先頭側100%にすることで、ループ後の先頭に自然につなげる。
-                for i in range(fade_length):
-                    alpha = (i + 1) / fade_length
-                    blended = cv2.addWeighted(end_frames[i], 1 - alpha, start_frames[i], alpha, 0)
-                    out.write(blended)
-                    wrote_frames += 1
+                    # 先頭Nフレームは末尾でフェードインさせるため、通常部分からは削る。
+                    normal_start = best_start + fade_length
+                    normal_end = best_end - fade_length
 
-        out.release()
+                    if normal_start <= normal_end:
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, normal_start)
+                        for _ in range(normal_start, normal_end + 1):
+                            ret, frame = self.cap.read()
+                            if ret:
+                                self.write_frame_to_ffmpeg(out, frame)
+                                wrote_frames += 1
+
+                    # 末尾Nフレームを、先頭Nフレームへ向かってクロスフェード。
+                    # 最後の合成フレームは先頭側100%にすることで、ループ後の先頭に自然につなげる。
+                    for i in range(fade_length):
+                        alpha = (i + 1) / fade_length
+                        blended = cv2.addWeighted(end_frames[i], 1 - alpha, start_frames[i], alpha, 0)
+                        self.write_frame_to_ffmpeg(out, blended)
+                        wrote_frames += 1
+
+            self.close_ffmpeg_writer(out)
+        except Exception as e:
+            write_error = e
+            try:
+                if out.stdin:
+                    out.stdin.close()
+            except Exception:
+                pass
+            try:
+                out.kill()
+            except Exception:
+                pass
+
+        if write_error:
+            self.status_var.set(f"エラー：{write_error}")
+            self.btn_export.config(state=tk.NORMAL)
+            return
 
         fade_note = f" / フェード{used_fade_length}F" if used_fade_length > 0 else ""
         self.status_var.set(f"完了！ 【 {out_path} 】 保存しました（{rank_name} / {wrote_frames}フレーム{fade_note} / SSIM={best_score:.4f}）")
